@@ -38,7 +38,8 @@
 <dialog id="settings">
   <form method="dialog">
     <label for="key">xAI API key</label>
-    <input id="key" type="password" autocomplete="off" placeholder="xai-...">
+    <input id="key" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="xai-...">
+    <label><input id="show" type="checkbox" style="width:auto"> إظهار · Show</label>
     <p>يُحفظ في هذا الجهاز فقط. Stored only in this browser.</p>
     <button value="save">حفظ · Save</button>
     <button value="cancel">إلغاء</button>
@@ -548,7 +549,8 @@
   });
 
   const dlg = $('#settings'), keyIn = $('#key');
-  $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.placeholder = ls.get('deskbot.key', '') ? '•••••••• (saved)' : 'xai-...'; dlg.showModal(); });
+  $('#show').addEventListener('change', e => { keyIn.type = e.target.checked ? 'text' : 'password'; });
+  $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.type = 'password'; $('#show').checked = false; keyIn.placeholder = ls.get('deskbot.key', '') ? '•••••••• (saved)' : 'xai-...'; dlg.showModal(); });
   dlg.addEventListener('close', () => {
     if (dlg.returnValue !== 'save' || !keyIn.value.trim()) return;
     ls.set('deskbot.key', keyIn.value.trim()); keyIn.value = '';
