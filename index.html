@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Desk Bot</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500&display=swap">
+<!--
+  Desk Bot for the Fire tablet: the round board's firmware (talk.c, tasks.c, face.c)
+  as one web page. Talks to the Grok Voice Agent straight from the browser:
+  the xAI key is typed in settings and kept in this browser's localStorage; the page
+  trades it for a 5-minute token (POST /v1/realtime/client_secrets) on every connect,
+  so the key itself never goes over the WebSocket. Tap the face to talk.
+  Needs HTTPS (or localhost) for the microphone.
+-->
+<style>
+  :root { color-scheme: dark; --ink: #ECEAE4; --muted: #8C919B; --line: #2A2D34; --accent: #9DB1FF; --amber: #FFB861; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--ink); font-family: "IBM Plex Sans Arabic", system-ui, sans-serif; overflow: hidden; user-select: none; -webkit-tap-highlight-color: transparent; }
+  main { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2vh; touch-action: manipulation; }
+  #face { width: min(100vw, 78vh); height: min(100vw, 78vh); }
+  #cap { min-height: 3.4em; max-width: min(92vw, 900px); padding-inline: 16px; text-align: center; font-size: clamp(16px, 3vh, 26px); line-height: 1.5; unicode-bidi: plaintext; }
+  #cap small { display: block; color: var(--muted); font-size: .7em; }
+  #gear { position: fixed; top: 12px; inset-inline-start: 12px; width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; color: #444; font-size: 24px; }
+  dialog { background: #17191E; color: var(--ink); border: 1px solid var(--line); border-radius: 14px; padding: 20px; width: min(90vw, 420px); }
+  dialog::backdrop { background: rgba(0,0,0,.7); }
+  dialog input { width: 100%; box-sizing: border-box; padding: 10px; margin-block: 8px 4px; font: inherit; background: #0C0D10; color: var(--ink); border: 1px solid var(--line); border-radius: 8px; direction: ltr; }
+  dialog p { color: var(--muted); font-size: 14px; margin: 6px 0 14px; }
+  dialog button { font: inherit; padding: 8px 18px; border-radius: 8px; border: 1px solid var(--line); background: #1F2228; color: var(--ink); }
+  dialog button[value=save] { background: var(--accent); color: #000; border: 0; }
+</style>
+
+<main id="main">
+  <canvas id="face" aria-label="Desk Bot face, tap to talk"></canvas>
+  <div id="cap" aria-live="polite"></div>
+</main>
+<button id="gear" aria-label="Settings">⚙</button>
+
+<dialog id="settings">
+  <form method="dialog">
+    <label for="key">xAI API key</label>
+    <input id="key" type="password" autocomplete="off" placeholder="xai-...">
+    <p>يُحفظ في هذا الجهاز فقط. Stored only in this browser.</p>
+    <button value="save">حفظ · Save</button>
+    <button value="cancel">إلغاء</button>
+  </form>
+</dialog>
+
+<script>
+(() => {
+  const $ = s => document.querySelector(s);
+  const GROK_URL = 'wss://api.x.ai/v1/realtime?model=grok-voice-latest';
+  const VOICE = 'ara';
+  const RATE = 16000;
+  const NO_SPEECH_MS = 8000;      // listening gives up if nothing louder than SPEECH_RMS
+  const MAX_TURN_MS = 20000;
+  const SPEECH_RMS = 0.02;        // calibration knob: mic level that counts as talking (0..1)
+  const SLEEP_AFTER_S = 90;
+
+  const INSTRUCTIONS =
+    'Your name is Alexa; you are a small desk robot with an animated face on a tablet (people may also call you Desk Bot). ' +
+    "Don't say your own name unless asked: the tablet's own assistant may wake up when it hears it. " +
+    'Keep every answer short: one or two sentences, about 25 words, ' +
+    'unless the user explicitly asks for detail. Give the answer first, no introductions. ' +
+    'Speak Saudi Arabic by default, in a natural everyday Saudi (Najdi) dialect, not formal Arabic. ' +
+    'If the user speaks English, answer in English. Switch freely when the user mixes languages. ' +
+    "You are witty and direct, never sycophantic. If you don't know something, say so. " +
+    'You can search the web and X for current information when a question needs it. ' +
+    'If the user asks you to speak louder or quieter, call set_volume.\n\n' +
+    'Tasks and reminders: the user\'s to-do list lives on this device; use manage_tasks to add, list, ' +
+    'complete or delete. For a reminder ("remind me at 3", "in 20 minutes") add it with due set to the ' +
+    'local time, worked out from the current time below. To complete or delete, use the id from the list ' +
+    "(list first if you don't have it). After a change, confirm in a few words; read the list only when asked. " +
+    'A message starting with [Reminder] is a reminder that is due now: tell the user in one short sentence.\n\n' +
+    'Your face: before you start speaking, call set_face exactly once with the expression that fits ' +
+    'your answer: happy (often with nod) for friendly or agreeable answers, laughing for jokes, ' +
+    'surprised for surprising facts, serious for serious topics, confused when you didn\'t understand. ' +
+    "Prefer an expressive face over neutral. Don't call it again during the same answer. " +
+    'Never mention the tool or describe your face out loud.';
+
+  // ------------------------------------------------------------ storage
+  const ls = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  };
+
+  // ------------------------------------------------------------ tasks (port of tasks.c)
+  const TASKS_MAX = 30, OVERDUE_SKIP_MS = 12 * 3600e3;
+  const pad = n => String(n).padStart(2, '0');
+  const fmtDue = ms => { const d = new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  function parseDue(s) {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/.exec(s || '');
+    return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime() : 0;
+  }
+  function tasksHandle(args) {
+    const s = ls.get('deskbot.tasks', { next_id: 1, list: [] });
+    const { action = 'list', text, due, id } = args;
+    let error = null;
+    if (action === 'add') {
+      if (!text) error = 'text is required';
+      else {
+        if (s.list.length >= TASKS_MAX) { const i = s.list.findIndex(t => t.done); if (i >= 0) s.list.splice(i, 1); }
+        if (s.list.length >= TASKS_MAX) error = 'the list is full (30 open tasks)';
+        else {
+          const t = { id: s.next_id++, text: String(text).slice(0, 120), due: parseDue(due), done: false, fired: false };
+          s.list.push(t);
+          if (due && !t.due) error = 'due must be local time YYYY-MM-DD HH:MM:SS; the task was added without a reminder';
+        }
+      }
+    } else if (action === 'complete' || action === 'delete') {
+      const i = s.list.findIndex(t => t.id === id);
+      if (i < 0) error = 'no task with that id; list the tasks first';
+      else if (action === 'complete') s.list[i].done = true;
+      else s.list.splice(i, 1);
+    } else if (action !== 'list') error = 'unknown action';
+    if (action !== 'list') ls.set('deskbot.tasks', s);
+    const out = { ok: !error, tasks: s.list.map(t => Object.assign({ id: t.id, text: t.text }, t.due ? { due: fmtDue(t.due) } : {}, { done: t.done })) };
+    if (error) out.error = error;
+    return out;
+  }
+  function takeDue() {
+    const s = ls.get('deskbot.tasks', { next_id: 1, list: [] }), now = Date.now();
+    let found = null, changed = false;
+    for (const t of s.list) {
+      if (found || t.done || t.fired || !t.due || t.due > now) continue;
+      t.fired = changed = true;
+      if (now - t.due < OVERDUE_SKIP_MS) found = t.text;
+    }
+    if (changed) ls.set('deskbot.tasks', s);
+    return found;
+  }
+
+  // ------------------------------------------------------------ audio
+  // One 16 kHz context for both ways: Chrome resamples the mic and the speaker.
+  const WORKLET = `class Mic extends AudioWorkletProcessor {
+    constructor() { super(); this.b = new Int16Array(1024); this.n = 0; }
+    process(inputs) {
+      const c = inputs[0][0];
+      if (c) for (let i = 0; i < c.length; i++) {
+        this.b[this.n++] = Math.max(-1, Math.min(1, c[i])) * 32767;
+        if (this.n === this.b.length) { this.port.postMessage(this.b.buffer, [this.b.buffer]); this.b = new Int16Array(1024); this.n = 0; }
+      }
+      return true;
+    }
+  }
+  registerProcessor('mic', Mic);`;
+  let ac = null, gain, analyser, playAt = 0;
+  const sources = new Set();
+  let volume = ls.get('deskbot.volume', 70);
+  let micLevel = 0;
+
+  async function audioInit() {
+    if (ac) { if (ac.state !== 'running') await ac.resume(); return; }
+    ac = new AudioContext({ sampleRate: RATE });
+    gain = ac.createGain(); gain.gain.value = volume / 70;
+    analyser = ac.createAnalyser(); analyser.fftSize = 512;
+    gain.connect(ac.destination); gain.connect(analyser);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    await ac.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
+    const mic = new AudioWorkletNode(ac, 'mic', { numberOfOutputs: 0 });
+    ac.createMediaStreamSource(stream).connect(mic);
+    mic.port.onmessage = e => onMic(e.data);
+  }
+  function setVolume(v) { volume = Math.max(30, Math.min(95, v)); ls.set('deskbot.volume', volume); if (gain) gain.gain.value = volume / 70; }
+  function playChunk(buf) {
+    if (!ac) return;
+    const pcm = new Int16Array(buf);
+    if (!pcm.length) return;
+    const b = ac.createBuffer(1, pcm.length, RATE), ch = b.getChannelData(0);
+    for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+    const src = ac.createBufferSource();
+    src.buffer = b; src.connect(gain);
+    const t = Math.max(ac.currentTime + 0.06, playAt);   // small cushion against network jitter
+    src.start(t); playAt = t + b.duration;
+    sources.add(src); src.onended = () => sources.delete(src);
+  }
+  function stopVoice() { for (const s of sources) { try { s.stop(); } catch (e) {} } sources.clear(); playAt = 0; }
+  const speaking = () => sources.size > 0;
+  function outLevel() {
+    if (!analyser || !speaking()) return 0;
+    const a = new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(a);
+    let s = 0; for (const v of a) s += v * v;
+    return Math.min(1, Math.sqrt(s / a.length) * 5);
+  }
+
+  // ------------------------------------------------------------ Grok
+  let ws = null, ready = false, status = '';
+  let listening = false, answerActive = false, pendingCall = false, faceSet = false;
+  let heardVoice = false, listenStart = 0;
+  let caption = { bot: '', user: '' };
+
+  const send = obj => { if (ws && ws.readyState === 1) ws.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); };
+
+  function tools(withFace) {
+    const t = [];
+    if (withFace) t.push({ type: 'function', name: 'set_face', description: "Change Desk Bot's facial expression and optionally make a head gesture.",
+      parameters: { type: 'object', properties: {
+        emotion: { type: 'string', enum: ['neutral', 'happy', 'surprised', 'confused', 'serious', 'laughing'] },
+        action: { type: 'string', enum: ['nod', 'shake', 'tilt', 'look_left', 'look_right'] } }, required: ['emotion'] } });
+    t.push({ type: 'function', name: 'set_volume', description: "Make Desk Bot's speaker louder or quieter when the user asks.",
+      parameters: { type: 'object', properties: { change: { type: 'string', enum: ['up', 'down', 'max', 'min'] } }, required: ['change'] } });
+    t.push({ type: 'function', name: 'manage_tasks', description: "The user's to-do list and reminders, stored on Desk Bot. Returns the full list.",
+      parameters: { type: 'object', properties: {
+        action: { type: 'string', enum: ['add', 'list', 'complete', 'delete'] },
+        text: { type: 'string', description: "add: the task, short, in the user's language" },
+        due: { type: 'string', description: 'add, only for reminders: local time as YYYY-MM-DD HH:MM:SS (24 h), to the second' },
+        id: { type: 'integer', description: 'complete/delete: the task id from the list' } }, required: ['action'] } });
+    t.push({ type: 'web_search' }, { type: 'x_search' });
+    return t;
+  }
+  function giveFaceBack() { if (faceSet) { faceSet = false; send({ type: 'session.update', session: { tools: tools(true) } }); } }
+
+  // Grok doesn't know the tablet's clock: refresh it before each answer.
+  function sendClock() {
+    const now = new Date();
+    const when = now.toLocaleDateString('en-GB', { weekday: 'long' }) + ' ' + fmtDue(now.getTime()) + ':' + pad(now.getSeconds());
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    send({ type: 'session.update', session: { instructions: `${INSTRUCTIONS}\n\nContext: the user is in Saudi Arabia. Current local date and time (${tz}): ${when}.` } });
+  }
+
+  // One pending connect at a time (a key saved during a retry wait must not open a second socket).
+  let connTimer = 0;
+  const scheduleConnect = ms => { clearTimeout(connTimer); connTimer = setTimeout(connect, ms); };
+
+  async function connect() {
+    ready = false;
+    const key = ls.get('deskbot.key', '');
+    if (!key) { status = 'اضغط ⚙ وأدخل مفتاح xAI · Tap ⚙ to add the xAI key'; return; }
+    status = 'جاري الاتصال… · Connecting…';
+    let token;
+    try {
+      const r = await fetch('https://api.x.ai/v1/realtime/client_secrets', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expires_after: { seconds: 300 } }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.error === 'string' ? d.error : (d.error && d.error.message) || 'HTTP ' + r.status);
+      token = d.value || (d.client_secret && d.client_secret.value) || d.token;
+      if (!token) throw new Error('no token in reply');
+    } catch (e) {
+      status = 'تعذّر الاتصال · ' + e.message;
+      scheduleConnect(15000);
+      return;
+    }
+    ws = new WebSocket(GROK_URL, ['xai-client-secret.' + token]);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      faceSet = false;
+      send({ type: 'session.update', session: {
+        voice: VOICE, instructions: INSTRUCTIONS, tools: tools(true),
+        turn_detection: { type: 'server_vad', silence_duration_ms: 700 },   // Grok hears the end of the question
+        audio: {
+          input: { format: { type: 'audio/pcm', rate: RATE }, transport: 'binary',
+                   transcription: { language_hint: 'ar-SA', keyterms: ['Desk Bot', 'Grok'] } },
+          output: { format: { type: 'audio/pcm', rate: RATE }, transport: 'binary' } } } });
+    };
+    ws.onmessage = e => {
+      if (typeof e.data !== 'string') { if (answerActive) playChunk(e.data); return; }
+      let ev; try { ev = JSON.parse(e.data); } catch (x) { return; }
+      onEvent(ev);
+    };
+    // xAI closes sessions idle for 15 min; just come back.
+    ws.onclose = () => { ws = null; ready = false; listening = false; answerActive = false; stopVoice(); status = 'انقطع الاتصال… · Reconnecting…'; scheduleConnect(3000); };
+  }
+
+  function onEvent(ev) {
+    const type = ev.type || '';
+    if (type === 'session.updated') {
+      if (!ready) { ready = true; status = ''; }
+    } else if (type === 'response.created') {
+      if (listening) { listening = false; caption.bot = ''; }
+      answerActive = true;
+    } else if (type === 'response.function_call_arguments.done') {
+      onToolCall(ev);
+    } else if (type === 'response.done') {
+      if (pendingCall) { pendingCall = false; send({ type: 'response.create' }); }  // carry on after the tool result
+      else answerActive = false;
+    } else if (type === 'response.output_audio_transcript.delta') {
+      caption.bot += ev.delta || '';
+    } else if (type === 'response.output_audio_transcript.done') {
+      caption.bot = ev.transcript || caption.bot;
+    } else if (type.endsWith('input_audio_transcription.completed')) {
+      caption.user = (ev.transcript || '').trim();
+    } else if (type === 'error') {
+      const msg = (ev.error && ev.error.message) || 'error';
+      console.warn('Grok error:', msg, ev);
+      if (answerActive) { answerActive = false; stopVoice(); st.emotion = 'confused'; resetFaceSoon(); }
+    }
+  }
+
+  function onToolCall(ev) {
+    let args = {}; try { args = JSON.parse(ev.arguments || '{}'); } catch (e) {}
+    let out = { ok: false };
+    if (ev.name === 'set_face') {
+      face(args.emotion || 'neutral', args.action);
+      out = { ok: true };
+    } else if (ev.name === 'set_volume') {
+      setVolume({ up: volume + 15, down: volume - 15, max: 95, min: 30 }[args.change] ?? volume);
+      out = { ok: true };
+    } else if (ev.name === 'manage_tasks') {
+      out = tasksHandle(args);
+    }
+    send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: ev.call_id || '', output: JSON.stringify(out) } });
+    if (out.ok && !faceSet) {
+      // Take set_face away until the next question so Grok can't pause mid-answer to call it again.
+      faceSet = true;
+      send({ type: 'session.update', session: { tools: tools(false) } });
+    }
+    pendingCall = true;
+  }
+
+  function onMic(buf) {
+    const pcm = new Int16Array(buf);
+    let s = 0; for (const v of pcm) s += v * v;
+    const rms = Math.sqrt(s / pcm.length) / 32768;
+    micLevel = listening ? Math.min(1, rms * 8) : 0;
+    if (!listening) return;
+    if (rms > SPEECH_RMS) heardVoice = true;
+    send(buf);   // binary frame = input_audio_buffer.append
+    const t = performance.now() - listenStart;
+    if (!heardVoice && t > NO_SPEECH_MS) stopListening(false);
+    else if (t > MAX_TURN_MS) stopListening(true);
+  }
+
+  function startListening() {
+    if (!ready) return;
+    if (answerActive) { send({ type: 'response.cancel' }); answerActive = false; }
+    pendingCall = false;
+    stopVoice();
+    send({ type: 'input_audio_buffer.clear' });
+    giveFaceBack();
+    sendClock();
+    caption = { bot: '', user: '' };
+    heardVoice = false; listenStart = performance.now();
+    listening = true;
+  }
+  // Tap again (or time limit): ask now instead of waiting for Grok's pause detection.
+  function stopListening(ask) {
+    if (!listening) return;
+    listening = false;
+    if (ask && heardVoice) { send({ type: 'input_audio_buffer.commit' }); send({ type: 'response.create' }); }
+    else send({ type: 'input_audio_buffer.clear' });   // nothing said: don't let it invent words out of silence
+  }
+
+  function remind(text) {
+    giveFaceBack();
+    sendClock();
+    caption = { bot: '', user: '⏰ ' + text };
+    send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Reminder] ' + text }] } });
+    send({ type: 'response.create' });
+    answerActive = true;
+    wakeUp();
+  }
+  setInterval(() => {
+    if (ready && ac && !answerActive && !listening && !speaking()) { const due = takeDue(); if (due) remind(due); }
+  }, 1000);
+
+  // ------------------------------------------------------------ face (Sleek, from mockup/desk-grok.html)
+  const cv = $('#face'), ctx = cv.getContext('2d');
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+  function fit() { const px = Math.round(cv.getBoundingClientRect().width * DPR); cv.width = cv.height = px; }
+  addEventListener('resize', fit); fit();
+  const T0 = performance.now(), now = () => (performance.now() - T0) / 1000, TAU = Math.PI * 2;
+  const COL = { eye: '#EEF1F7', glow: 'rgba(160,185,255,0.55)', accent: '#9DB1FF', listen: '#6FD3FF', think: '#B9A4FF', amber: '#FFB861' };
+  const st = { mode: 'idle', emotion: 'neutral', action: null, actionStart: 0, look: { x: 0, y: 0 }, glance: { x: 0, y: 0 }, nextGlance: 1, blinkAt: 2, blinkStart: -9, amp: 0, lastActive: 0 };
+  const ACT = { nod: 0.9, shake: 1.0, tilt: 1.5, look_left: 1.8, look_right: 1.8 };
+  let faceTimer = 0;
+  function face(emotion, action) { st.emotion = emotion; if (ACT[action]) { st.action = action; st.actionStart = now(); } clearTimeout(faceTimer); }
+  function resetFaceSoon() { clearTimeout(faceTimer); faceTimer = setTimeout(() => { st.emotion = 'neutral'; }, 2500); }
+  function wakeUp() { st.lastActive = now(); }
+  function activeAction(t) {
+    if (!st.action) return null;
+    const p = (t - st.actionStart) / ACT[st.action];
+    if (p >= 1) { st.action = null; return null; }
+    return { name: st.action, p };
+  }
+
+  function update(t, dt) {
+    const prev = st.mode;
+    st.mode = !ready ? 'offline' : listening ? 'listening' : speaking() ? 'speaking' : answerActive ? 'thinking' : 'idle';
+    if (st.mode !== 'idle') st.lastActive = t;
+    else if (t - st.lastActive > SLEEP_AFTER_S) st.mode = 'sleeping';
+    if (prev === 'speaking' && st.mode !== 'speaking' && st.emotion !== 'neutral') resetFaceSoon();
+
+    if (t > st.blinkAt && st.mode !== 'sleeping') { st.blinkStart = t; st.blinkAt = t + 2.2 + Math.random() * 3.8; if (Math.random() < 0.15) st.blinkAt = t + 0.32; }
+    const act = activeAction(t);
+    let tg;
+    if (act && (act.name === 'look_left' || act.name === 'look_right')) tg = { x: act.name === 'look_left' ? -0.95 : 0.95, y: 0 };
+    else if (st.mode === 'thinking') tg = { x: 0.6, y: -0.8 };
+    else if (st.mode === 'sleeping') tg = { x: 0, y: 0.3 };
+    else if (st.mode === 'listening') tg = { x: 0, y: 0.05 };
+    else if (st.mode === 'speaking') tg = { x: Math.sin(t * 0.7) * 0.25, y: 0 };
+    else {
+      if (t > st.nextGlance) { st.nextGlance = t + 1.6 + Math.random() * 2.8; st.glance = Math.random() < 0.4 ? { x: 0, y: 0 } : { x: (Math.random() * 2 - 1) * 0.75, y: (Math.random() * 2 - 1) * 0.45 }; }
+      tg = st.glance;
+    }
+    const k = Math.min(1, dt * 9);
+    st.look.x += (tg.x - st.look.x) * k; st.look.y += (tg.y - st.look.y) * k;
+    const target = st.mode === 'speaking' ? outLevel() : st.mode === 'listening' ? micLevel : 0;
+    st.amp += (target - st.amp) * Math.min(1, dt * 18);
+  }
+
+  function rrect(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    ctx.beginPath(); ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function ring(r, a0, a1, color, w, alpha, glow) {
+    ctx.save(); ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = 'round';
+    if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+    ctx.beginPath(); ctx.arc(180, 180, r, a0, a1); ctx.stroke(); ctx.restore();
+  }
+  function drawRing(t) {
+    const R = 170;
+    switch (st.mode) {
+      case 'idle': ring(R, 0, TAU, COL.accent, 3, 0.35, 10); break;
+      case 'offline': ring(R, 0, TAU, COL.amber, 3, 0.2 + (Math.sin(t * 2) * 0.5 + 0.5) * 0.3, 10); break;
+      case 'listening': ring(R, 0, TAU, COL.listen, 2.5 + st.amp * 6, 0.45 + st.amp * 0.5, 18); break;
+      case 'thinking': { const s = t * 3.2; ring(R, 0, TAU, '#FFFFFF', 2, 0.05); ring(R, s, s + 1.1, COL.think, 4, 0.95, 14); ring(R, s + Math.PI, s + Math.PI + 1.1, COL.think, 4, 0.5, 10); break; }
+      case 'speaking': ring(R, 0, TAU, '#E6EAF5', 2 + st.amp * 4, 0.12 + st.amp * 0.35, 12); break;
+    }
+  }
+  function drawEye(x, y, side, open) {
+    const emo = st.emotion, mode = st.mode;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    if (mode === 'sleeping') { ctx.lineWidth = 7; ctx.beginPath(); ctx.arc(x, y - 8, 20, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke(); return; }
+    if (emo === 'happy' || emo === 'laughing') { ctx.lineWidth = 10; ctx.beginPath(); ctx.arc(x, y + 12, 22, 1.15 * Math.PI, 1.85 * Math.PI); ctx.stroke(); return; }
+    const s = emo === 'surprised' ? 1.22 : mode === 'listening' ? 1.08 : 1;
+    const w = 36 * s; let h = 66 * s;
+    if (emo === 'confused' && side === -1) h *= 0.6;
+    const hh = Math.max(4, h * open), top = y - hh / 2;
+    let lid = null;
+    if (emo === 'serious') lid = top + hh * 0.32;
+    else if (mode === 'thinking') lid = top + hh * 0.18;
+    ctx.save();
+    if (lid !== null) { ctx.beginPath(); ctx.rect(x - w, lid, w * 2, y + h - lid); ctx.clip(); }
+    rrect(x - w / 2, top, w, hh, Math.min(w / 2, hh / 2)); ctx.fill();
+    ctx.restore();
+  }
+  function drawMouth(x, y, t) {
+    const emo = st.emotion, mode = st.mode;
+    ctx.lineWidth = 7; ctx.lineCap = 'round';
+    if (mode === 'sleeping') { ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(x, y, 5 + Math.sin(t * 0.9) * 1.5, 0, TAU); ctx.stroke(); return; }
+    if (mode === 'speaking' || emo === 'laughing') {
+      let a = mode === 'speaking' ? st.amp : 0;
+      if (emo === 'laughing') a = Math.max(a, 0.55 + Math.abs(Math.sin(t * 9)) * 0.35);
+      const w = 26 + a * 14, h = 5 + a * 26;
+      if (emo === 'happy' || emo === 'laughing') {
+        ctx.beginPath(); ctx.moveTo(x - w / 2 - 4, y - 2);
+        ctx.quadraticCurveTo(x, y - 6, x + w / 2 + 4, y - 2);
+        ctx.quadraticCurveTo(x + w / 2, y + h, x, y + h);
+        ctx.quadraticCurveTo(x - w / 2, y + h, x - w / 2 - 4, y - 2); ctx.fill();
+      } else { rrect(x - w / 2, y - h / 2, w, h, Math.min(w, h) / 2); ctx.fill(); }
+      return;
+    }
+    ctx.beginPath();
+    switch (emo) {
+      case 'happy': ctx.arc(x, y - 16, 24, 0.22 * Math.PI, 0.78 * Math.PI); break;
+      case 'surprised': ctx.lineWidth = 6; ctx.arc(x, y + 2, 11, 0, TAU); break;
+      case 'serious': ctx.moveTo(x - 18, y); ctx.lineTo(x + 18, y); break;
+      case 'confused': ctx.moveTo(x - 20, y); for (let i = 1; i <= 20; i++) ctx.lineTo(x - 20 + i * 2, y + Math.sin(i / 20 * Math.PI * 2.2) * 5); break;
+      default:
+        if (mode === 'thinking') { ctx.moveTo(x - 6, y + 2); ctx.lineTo(x + 14, y - 3); }
+        else if (mode === 'listening') { ctx.lineWidth = 6; ctx.arc(x, y, 7 + st.amp * 6, 0, TAU); }
+        else ctx.arc(x, y - 12, 18, 0.28 * Math.PI, 0.72 * Math.PI);
+    }
+    ctx.stroke();
+  }
+  function drawZ(t) {
+    ctx.save(); ctx.fillStyle = COL.eye;
+    for (let i = 0; i < 3; i++) {
+      const ph = (t * 0.3 + i / 3) % 1;
+      ctx.globalAlpha = Math.sin(ph * Math.PI) * 0.9;
+      ctx.font = `600 ${Math.round(14 + ph * 14)}px sans-serif`;
+      ctx.fillText('z', 236 + ph * 44, 120 - ph * 70);
+    }
+    ctx.restore();
+  }
+  const TINT = { idle: 'rgba(120,140,255,0.10)', offline: 'rgba(255,175,90,0.06)', listening: 'rgba(80,200,255,0.18)', thinking: 'rgba(170,150,255,0.16)', speaking: 'rgba(220,225,240,0.09)', sleeping: 'rgba(80,90,140,0.05)' };
+  function draw(t) {
+    const sc = cv.width / 360;
+    ctx.setTransform(sc, 0, 0, sc, 0, 0); ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 360, 360);
+    const g = ctx.createRadialGradient(180, 170, 10, 180, 180, 190);
+    g.addColorStop(0, TINT[st.mode]); g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, 360, 360);
+    drawRing(t);
+    const act = activeAction(t), sleeping = st.mode === 'sleeping';
+    let dx = 0, dy = Math.sin(t * (sleeping ? 0.9 : 1.7)) * (sleeping ? 4 : 2.5), rot = 0;
+    if (act) {
+      if (act.name === 'nod') dy += Math.sin(act.p * Math.PI * 4) * 10 * (1 - act.p);
+      if (act.name === 'shake') dx += Math.sin(act.p * Math.PI * 6) * 12 * (1 - act.p);
+      if (act.name === 'tilt') rot += 0.2 * Math.sin(act.p * Math.PI);
+    }
+    if (st.emotion === 'laughing') dy -= Math.abs(Math.sin(t * 9)) * 6;
+    if (st.emotion === 'confused') rot -= 0.1;
+    if (st.mode === 'listening') dy += 3;
+    ctx.save(); ctx.translate(180 + dx, 160 + dy); ctx.rotate(rot);
+    const bp = (t - st.blinkStart) / 0.16;
+    const open = Math.max(0.08, bp >= 0 && bp < 1 ? Math.abs(Math.cos(bp * Math.PI)) : 1);
+    ctx.fillStyle = COL.eye; ctx.strokeStyle = COL.eye; ctx.shadowColor = COL.glow; ctx.shadowBlur = 22;
+    for (const side of [-1, 1]) drawEye(side * 62 + st.look.x * 16, -18 + st.look.y * 12, side, open);
+    drawMouth(st.look.x * 7, 60 + st.look.y * 4, t);
+    ctx.restore();
+    if (sleeping) { ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(0, 0, 360, 360); drawZ(t); }
+  }
+
+  const capEl = $('#cap');
+  let capHTML = '';
+  function renderCaption() {
+    const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    let html;
+    if (status) html = `<small>${esc(status)}</small>`;
+    else if (st.mode === 'listening') html = '<small>أسمعك… · Listening</small>';
+    else if (!ac) html = '<small>اضغط على الوجه للتحدث · Tap the face to talk</small>';
+    else if (st.mode === 'sleeping') html = '';
+    else html = (caption.user ? `<small>${esc(caption.user)}</small>` : '') + esc(caption.bot);
+    html = html.replace(/ · /g, '<br>');   // Arabic and English on their own lines (mixed bidi runs scramble)
+    if (html !== capHTML) { capEl.innerHTML = html; capHTML = html; }
+  }
+
+  let last = performance.now();
+  function loop(ms) {
+    const dt = Math.min(0.1, (ms - last) / 1000); last = ms;
+    const t = now();
+    update(t, dt); draw(t); renderCaption();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ------------------------------------------------------------ touch, screen, settings
+  let wakeLock = null;
+  async function keepScreenOn() { try { if (!wakeLock && navigator.wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.onrelease = () => { wakeLock = null; }; } } catch (e) {} }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') keepScreenOn(); });
+
+  $('#main').addEventListener('click', async () => {
+    wakeUp();
+    try {
+      if (!document.fullscreenElement && document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
+      keepScreenOn();
+      await audioInit();
+    } catch (e) {
+      status = 'لا يوجد ميكروفون · Microphone blocked: ' + e.message;
+      return;
+    }
+    if (status.startsWith('لا يوجد')) status = '';
+    if (listening) stopListening(true);
+    else startListening();
+  });
+
+  const dlg = $('#settings'), keyIn = $('#key');
+  $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.placeholder = ls.get('deskbot.key', '') ? '•••••••• (saved)' : 'xai-...'; dlg.showModal(); });
+  dlg.addEventListener('close', () => {
+    if (dlg.returnValue !== 'save' || !keyIn.value.trim()) return;
+    ls.set('deskbot.key', keyIn.value.trim()); keyIn.value = '';
+    if (ws) ws.close(); else scheduleConnect(0);   // onclose reconnects with the new key
+  });
+
+  connect();
+})();
+</script>
+</html>
