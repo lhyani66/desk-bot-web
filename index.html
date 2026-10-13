@@ -552,8 +552,10 @@
   $('#show').addEventListener('change', e => { keyIn.type = e.target.checked ? 'text' : 'password'; });
   $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.type = 'password'; $('#show').checked = false; keyIn.placeholder = ls.get('deskbot.key', '') ? '•••••••• (saved)' : 'xai-...'; dlg.showModal(); });
   dlg.addEventListener('close', () => {
-    if (dlg.returnValue !== 'save' || !keyIn.value.trim()) return;
-    ls.set('deskbot.key', keyIn.value.trim()); keyIn.value = '';
+    const key = keyIn.value.replace(/\s+/g, '');   // spaces allowed: the key can be typed in groups
+    keyIn.value = '';
+    if (dlg.returnValue !== 'save' || !key) return;
+    ls.set('deskbot.key', key);
     if (ws) ws.close(); else scheduleConnect(0);   // onclose reconnects with the new key
   });
 
