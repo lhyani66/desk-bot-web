@@ -7,10 +7,10 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500&display=swap">
 <!--
   Desk Bot for the Fire tablet: the round board's firmware (talk.c, tasks.c, face.c)
-  as one web page. Talks to the Grok Voice Agent straight from the browser:
-  the xAI key is typed in settings and kept in this browser's localStorage; the page
-  trades it for a 5-minute token (POST /v1/realtime/client_secrets) on every connect,
-  so the key itself never goes over the WebSocket. Tap the face to talk.
+  as one web page. Talks to the Grok Voice Agent straight from the browser.
+  The xAI key never reaches the device: on every connect the page sends a short PIN
+  (typed once under ⚙, kept in localStorage) to our token server (token-server/, a
+  Cloudflare Worker holding the key) and gets back a 5-minute Grok token. Tap the face to talk.
   Needs HTTPS (or localhost) for the microphone.
 -->
 <style>
@@ -37,8 +37,8 @@
 
 <dialog id="settings">
   <form method="dialog">
-    <label for="key">xAI API key</label>
-    <input id="key" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="xai-...">
+    <label for="key">PIN</label>
+    <input id="key" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
     <label><input id="show" type="checkbox" style="width:auto"> إظهار · Show</label>
     <p>يُحفظ في هذا الجهاز فقط. Stored only in this browser.</p>
     <button value="save">حفظ · Save</button>
@@ -50,6 +50,7 @@
 (() => {
   const $ = s => document.querySelector(s);
   const GROK_URL = 'wss://api.x.ai/v1/realtime?model=grok-voice-latest';
+  const TOKEN_URL = 'https://desk-bot-token.SUBDOMAIN.workers.dev';   // token-server/ after `wrangler deploy`
   const VOICE = 'ara';
   const RATE = 16000;
   const NO_SPEECH_MS = 8000;      // listening gives up if nothing louder than SPEECH_RMS
@@ -224,17 +225,15 @@
 
   async function connect() {
     ready = false;
-    const key = ls.get('deskbot.key', '');
-    if (!key) { status = 'اضغط ⚙ وأدخل مفتاح xAI · Tap ⚙ to add the xAI key'; return; }
+    const pin = ls.get('deskbot.pin', '');
+    if (!pin) { status = 'اضغط ⚙ وأدخل الرقم السري · Tap ⚙ to enter the PIN'; return; }
     status = 'جاري الاتصال… · Connecting…';
     let token;
     try {
-      const r = await fetch('https://api.x.ai/v1/realtime/client_secrets', {
-        method: 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ expires_after: { seconds: 300 } }) });
+      const r = await fetch(TOKEN_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin }) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(typeof d.error === 'string' ? d.error : (d.error && d.error.message) || 'HTTP ' + r.status);
-      token = d.value || (d.client_secret && d.client_secret.value) || d.token;
+      token = d.value;
       if (!token) throw new Error('no token in reply');
     } catch (e) {
       status = 'تعذّر الاتصال · ' + e.message;
@@ -550,12 +549,12 @@
 
   const dlg = $('#settings'), keyIn = $('#key');
   $('#show').addEventListener('change', e => { keyIn.type = e.target.checked ? 'text' : 'password'; });
-  $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.type = 'password'; $('#show').checked = false; keyIn.placeholder = ls.get('deskbot.key', '') ? '•••••••• (saved)' : 'xai-...'; dlg.showModal(); });
+  $('#gear').addEventListener('click', e => { e.stopPropagation(); keyIn.value = ''; keyIn.type = 'password'; $('#show').checked = false; keyIn.placeholder = ls.get('deskbot.pin', '') ? '•••• (saved)' : ''; dlg.showModal(); });
   dlg.addEventListener('close', () => {
-    const key = keyIn.value.replace(/\s+/g, '');   // spaces allowed: the key can be typed in groups
+    const key = keyIn.value.trim();
     keyIn.value = '';
     if (dlg.returnValue !== 'save' || !key) return;
-    ls.set('deskbot.key', key);
+    ls.set('deskbot.pin', key);
     if (ws) ws.close(); else scheduleConnect(0);   // onclose reconnects with the new key
   });
 
