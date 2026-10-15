@@ -188,6 +188,9 @@
   let ws = null, ready = false, status = '';
   let listening = false, answerActive = false, pendingCall = false, faceSet = false;
   let heardVoice = false, listenStart = 0;
+  let micFrames = 0, micPeak = 0;          // what the mic delivered this turn (shown while listening)
+  let notice = '', noticeUntil = 0;        // short message under the face
+  const say = (msg, ms = 8000) => { notice = msg; noticeUntil = performance.now() + ms; };
   let caption = { bot: '', user: '' };
 
   const send = obj => { if (ws && ws.readyState === 1) ws.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); };
@@ -282,6 +285,7 @@
     } else if (type === 'error') {
       const msg = (ev.error && ev.error.message) || 'error';
       console.warn('Grok error:', msg, ev);
+      say('Grok: ' + msg);
       if (answerActive) { answerActive = false; stopVoice(); st.emotion = 'confused'; resetFaceSoon(); }
     }
   }
@@ -313,12 +317,20 @@
     const rms = Math.sqrt(s / pcm.length) / 32768;
     micLevel = listening ? Math.min(1, rms * 8) : 0;
     if (!listening) return;
+    micFrames++; micPeak = Math.max(micPeak, rms);
     if (rms > SPEECH_RMS) heardVoice = true;
     send(buf);   // binary frame = input_audio_buffer.append
-    const t = performance.now() - listenStart;
-    if (!heardVoice && t > NO_SPEECH_MS) stopListening(false);
-    else if (t > MAX_TURN_MS) stopListening(true);
   }
+  // Turn limits on a timer, not in onMic: if the mic delivers nothing, onMic never runs.
+  setInterval(() => {
+    if (!listening) return;
+    const t = performance.now() - listenStart;
+    if (!heardVoice && t > NO_SPEECH_MS) {
+      stopListening(false);
+      say(micFrames ? `لم أسمع صوتا · Mic is silent (loudest ${micPeak.toFixed(3)}, needs ${SPEECH_RMS})`
+                    : 'الميكروفون لا يرسل صوتا · No audio from the mic at all');
+    } else if (t > MAX_TURN_MS) stopListening(true);
+  }, 250);
 
   function startListening() {
     if (!ready) return;
@@ -329,7 +341,7 @@
     giveFaceBack();
     sendClock();
     caption = { bot: '', user: '' };
-    heardVoice = false; listenStart = performance.now();
+    heardVoice = false; listenStart = performance.now(); micFrames = 0; micPeak = 0; notice = '';
     listening = true;
   }
   // Tap again (or time limit): ask now instead of waiting for Grok's pause detection.
@@ -510,7 +522,11 @@
     const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     let html;
     if (status) html = `<small>${esc(status)}</small>`;
-    else if (st.mode === 'listening') html = '<small>أسمعك… · Listening</small>';
+    else if (st.mode === 'listening') {
+      const n = Math.round(micLevel * 10);   // live level
+      html = `<small>أسمعك… · Listening</small><small dir="ltr">mic ${'▮'.repeat(n)}${'▯'.repeat(10 - n)} ${micFrames ? '' : '(no audio yet)'}</small>`;
+    }
+    else if (notice && performance.now() < noticeUntil) html = `<small>${esc(notice)}</small>`;
     else if (!ac) html = '<small>اضغط على الوجه للتحدث · Tap the face to talk</small>';
     else if (st.mode === 'sleeping') html = '';
     else html = (caption.user ? `<small>${esc(caption.user)}</small>` : '') + esc(caption.bot);
